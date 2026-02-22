@@ -17,6 +17,8 @@ node_modules/
 .idea/
 .vscode/
 *.swp
+.copilot/
+.github
 
 # 系统文件
 .DS_Store

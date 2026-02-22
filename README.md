@@ -8,6 +8,7 @@
 - 🧠 Claude AI 驱动
 - 🔌 OneBot v11 协议
 - 🔄 反向 WebSocket 连接
+- 📝 自动将 Markdown 回复转为 QQ 友好文本
 
 ## 架构
 
@@ -83,6 +84,16 @@ cp deploy/com.fanzhh.qq-onebot-bot.plist ~/Library/LaunchAgents/
 
 # 加载服务
 launchctl load ~/Library/LaunchAgents/com.fanzhh.qq-onebot-bot.plist
+```
+
+服务健康检查（脚本）：
+
+```bash
+chmod +x deploy/service.sh
+./deploy/service.sh status      # 查看服务与端口
+./deploy/service.sh logs        # 查看运行日志
+./deploy/service.sh error-logs  # 查看错误日志
+./deploy/service.sh restart     # 重启服务
 ```
 
 ## 使用
