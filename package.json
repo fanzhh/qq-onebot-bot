@@ -1,0 +1,16 @@
+{
+  "name": "qq-onebot-bot",
+  "version": "1.0.0",
+  "description": "QQ Bot powered by Claude AI - OneBot v11 协议",
+  "main": "index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "bun --watch run index.ts"
+  },
+  "keywords": ["qq-bot", "onebot", "claude", "ai", "chatbot"],
+  "author": "fanzhh",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}

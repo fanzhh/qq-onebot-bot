@@ -1,0 +1,23 @@
+# 环境变量
+.env
+.env.local
+
+# 日志
+logs/
+*.log
+
+# NapCat 数据
+deploy/napcat/napcat/
+deploy/napcat/shared_media/
+
+# 依赖
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统文件
+.DS_Store
+Thumbs.db

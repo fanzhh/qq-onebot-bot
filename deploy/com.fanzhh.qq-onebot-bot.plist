@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fanzhh.qq-onebot-bot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mac/.bun/bin/bun</string>
+        <string>run</string>
+        <string>index.ts</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/mac/projects/qq-onebot-bot</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/mac/projects/qq-onebot-bot/logs/qq-onebot-bot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mac/projects/qq-onebot-bot/logs/qq-onebot-bot-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/mac/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/mac</string>
+        <key>USER</key>
+        <string>mac</string>
+        <key>ONEBOT_PORT</key>
+        <string>3002</string>
+    </dict>
+</dict>
+</plist>
