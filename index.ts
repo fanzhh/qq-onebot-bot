@@ -28,6 +28,8 @@ if (configuredClaudeDir && !existsSync(configuredClaudeDir)) {
 let selfId: number | null = null;
 let wsClient: WebSocket | null = null;
 const pendingRequests: Map<string, { resolve: Function; reject: Function; timer: Timer }> = new Map();
+const conversationHistory: Map<string, Array<{ role: "user" | "assistant"; text: string }>> = new Map();
+const MAX_HISTORY_MESSAGES = 12;
 
 // ============== 初始化 ==============
 
@@ -160,6 +162,32 @@ function formatMarkdownForQQ(input: string): string {
     .trim();
 }
 
+function buildPromptWithHistory(chatKey: string, userMessage: string): string {
+  const history = conversationHistory.get(chatKey) || [];
+  if (history.length === 0) return userMessage;
+
+  const historyText = history
+    .map((item) => `${item.role === "user" ? "用户" : "助手"}: ${item.text}`)
+    .join("\n");
+
+  return [
+    "以下是同一会话最近的对话记录，请结合上下文回答，避免重复：",
+    historyText,
+    "",
+    `用户: ${userMessage}`,
+  ].join("\n");
+}
+
+function appendConversation(chatKey: string, userMessage: string, assistantMessage: string): void {
+  const history = conversationHistory.get(chatKey) || [];
+  history.push({ role: "user", text: userMessage });
+  history.push({ role: "assistant", text: assistantMessage });
+  if (history.length > MAX_HISTORY_MESSAGES) {
+    history.splice(0, history.length - MAX_HISTORY_MESSAGES);
+  }
+  conversationHistory.set(chatKey, history);
+}
+
 async function handleMessage(event: OneBotEvent) {
   if (event.post_type !== "message") return;
 
@@ -194,6 +222,21 @@ async function handleMessage(event: OneBotEvent) {
   
   const sender = event.sender || {};
   const nickname = sender.nickname || sender.card || `用户${userId}`;
+  const chatKey = event.message_type === "group" ? `group:${event.group_id}` : `private:${userId}`;
+  let promptText = text;
+
+  if (event.message_type === "group") {
+    // 群聊需要 @ 机器人
+    if (!Array.isArray(message) || !message.some(s => s.type === "at" && String(s.data?.qq) === String(selfId))) {
+      console.log(`[跳过] 群聊消息未@机器人`);
+      return;
+    }
+    promptText = text.replace(/\[CQ:at[^\]]*\]\s*/g, "").trim();
+    if (!promptText) {
+      console.log(`[跳过] 群聊消息内容为空`);
+      return;
+    }
+  }
 
   console.log(`[消息] ${nickname}(${userId}): ${text}`);
   console.log(`[Claude] 开始调用...`);
@@ -201,9 +244,10 @@ async function handleMessage(event: OneBotEvent) {
   try {
     const startTime = Date.now();
     // 调用 Claude 处理消息
-    const response = await callClaude(text);
+    const response = await callClaude(buildPromptWithHistory(chatKey, promptText));
     const duration = Date.now() - startTime;
     console.log(`[Claude] 响应完成，耗时: ${duration}ms, 长度: ${response.length}`);
+    appendConversation(chatKey, promptText, response);
     
     const qqFriendlyResponse = formatMarkdownForQQ(response);
     const maxLen = 4000;
@@ -212,16 +256,6 @@ async function handleMessage(event: OneBotEvent) {
       : qqFriendlyResponse;
     
     if (event.message_type === "group") {
-      // 群聊需要 @ 机器人
-      if (!Array.isArray(message) || !message.some(s => s.type === "at" && String(s.data?.qq) === String(selfId))) {
-        console.log(`[跳过] 群聊消息未@机器人`);
-        return;
-      }
-      const cleanText = text.replace(/\[CQ:at[^\]]*\]\s*/g, "").trim();
-      if (!cleanText) {
-        console.log(`[跳过] 群聊消息内容为空`);
-        return;
-      }
       console.log(`[发送] 群聊回复 -> ${event.group_id}`);
       // 发送消息不等待响应，避免超时
       sendMessageNoWait("send_group_msg", { group_id: event.group_id, message: finalResponse });
