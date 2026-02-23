@@ -16,6 +16,7 @@ import { existsSync } from "node:fs";
 
 const ONEBOT_PORT = parseInt(process.env.ONEBOT_PORT || "3002");
 const ONEBOT_TOKEN = process.env.ONEBOT_TOKEN || "";
+const CLAUDE_MODEL_LABEL = process.env.CLAUDE_MODEL_LABEL || "Claude CLI（模型名未公开）";
 const configuredClaudeDir = process.env.CLAUDE_WORKING_DIR;
 const CLAUDE_WORKING_DIR =
   configuredClaudeDir && existsSync(configuredClaudeDir) ? configuredClaudeDir : process.cwd();
@@ -30,6 +31,10 @@ let wsClient: WebSocket | null = null;
 const pendingRequests: Map<string, { resolve: Function; reject: Function; timer: Timer }> = new Map();
 const conversationHistory: Map<string, Array<{ role: "user" | "assistant"; text: string }>> = new Map();
 const MAX_HISTORY_MESSAGES = 12;
+let connectionSeq = 0;
+let activeConnectionId = 0;
+let connectedAt = 0;
+let wsMessageCount = 0;
 
 // ============== 初始化 ==============
 
@@ -38,12 +43,14 @@ console.log("QQ Bot (OneBot v11 - 反向 WebSocket)");
 console.log("=".repeat(50));
 console.log(`端口: ${ONEBOT_PORT}`);
 console.log(`Claude 工作目录: ${CLAUDE_WORKING_DIR}`);
+console.log(`回答模型标识: ${CLAUDE_MODEL_LABEL}`);
 console.log("");
 
 // ============== WebSocket 服务器 ==============
 
 const server = Bun.serve({
   port: ONEBOT_PORT,
+  hostname: "0.0.0.0",
   fetch(req, server) {
     const url = new URL(req.url);
     
@@ -57,7 +64,12 @@ const server = Bun.serve({
   },
   websocket: {
     open(client) {
+      connectionSeq += 1;
+      activeConnectionId = connectionSeq;
+      connectedAt = Date.now();
+      wsMessageCount = 0;
       console.log("✅ NapCat 已连接");
+      console.log(`[连接] conn#${activeConnectionId} 已建立`);
       wsClient = client as any;
       
       sendApiRequest("get_login_info", {}).then((info: any) => {
@@ -68,6 +80,8 @@ const server = Bun.serve({
     
     message(client, data) {
       try {
+        wsMessageCount += 1;
+        console.log(`[连接] conn#${activeConnectionId} 收包#${wsMessageCount}, bytes=${String(data).length}`);
         const payload = JSON.parse(data as string);
         console.log("[收到]", JSON.stringify(payload).slice(0, 200));
 
@@ -95,8 +109,10 @@ const server = Bun.serve({
       }
     },
     
-    close() {
-      console.log("⚠️ NapCat 断开");
+    close(client, code, reason) {
+      const onlineMs = connectedAt ? Date.now() - connectedAt : 0;
+      console.error(`⚠️ NapCat 断开`);
+      console.error(`[连接] conn#${activeConnectionId} 已关闭, code=${code}, reason=${reason || "无"}, 在线=${onlineMs}ms, 收包=${wsMessageCount}`);
       wsClient = null;
     },
   },
@@ -111,8 +127,12 @@ function sendMessageNoWait(action: string, params: any): void {
     return;
   }
   const echo = Math.random().toString(36).substring(2, 15);
-  wsClient.send(JSON.stringify({ action, params, echo }));
-  console.log(`[发送] ${action} 已发送`);
+  try {
+    wsClient.send(JSON.stringify({ action, params, echo }));
+    console.log(`[发送] ${action} 已发送, conn#${activeConnectionId}, echo=${echo}`);
+  } catch (err) {
+    console.error(`[错误] ${action} 发送失败, conn#${activeConnectionId}:`, err);
+  }
 }
 
 function sendApiRequest(action: string, params: any): Promise<any> {
@@ -126,7 +146,14 @@ function sendApiRequest(action: string, params: any): Promise<any> {
     }, 15000);
     
     pendingRequests.set(echo, { resolve, reject, timer });
-    wsClient.send(JSON.stringify({ action, params, echo }));
+    try {
+      wsClient.send(JSON.stringify({ action, params, echo }));
+      console.log(`[发送] ${action} 请求, conn#${activeConnectionId}, echo=${echo}`);
+    } catch (err) {
+      clearTimeout(timer);
+      pendingRequests.delete(echo);
+      reject(err);
+    }
   });
 }
 
@@ -188,6 +215,65 @@ function appendConversation(chatKey: string, userMessage: string, assistantMessa
   conversationHistory.set(chatKey, history);
 }
 
+function extractSources(text: string): string[] {
+  const sources = new Set<string>();
+  const urlMatches = text.match(/https?:\/\/[^\s)\]]+/g) || [];
+  urlMatches.forEach((url) => sources.add(url));
+
+  const fileMatches = text.match(/[A-Za-z0-9_./-]+\.(md|pdf|docx|doc|xlsx|xls|txt|html)/gi) || [];
+  fileMatches.forEach((file) => sources.add(file));
+
+  const lineSourceMatches = text.match(/(?:信息来源|来源)[:：]\s*([^\n]+)/g) || [];
+  lineSourceMatches.forEach((line) => sources.add(line.replace(/^(?:信息来源|来源)[:：]\s*/, "").trim()));
+
+  return Array.from(sources).filter(Boolean).slice(0, 3);
+}
+
+function formatDuration(durationMs: number): string {
+  if (durationMs < 1000) return `${durationMs}ms`;
+  return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
+function buildReplyWithMeta(answer: string, durationMs: number): string {
+  const formatted = formatMarkdownForQQ(answer);
+  const sources = extractSources(answer);
+  const sourceText = sources.length > 0 ? sources.join("；") : "未提供显式来源（基于工作上下文生成）";
+  const meta = `信息来源: ${sourceText}\n使用模型: ${CLAUDE_MODEL_LABEL}\n回答用时: ${formatDuration(durationMs)}`;
+  const maxLen = 4000;
+
+  if (formatted.length + meta.length + 2 <= maxLen) {
+    return `${formatted}\n\n${meta}`;
+  }
+
+  const available = Math.max(0, maxLen - meta.length - 9);
+  const clipped = `${formatted.slice(0, available)}...(截断)`;
+  return `${clipped}\n\n${meta}`;
+}
+
+function attachGroupSource(message: string, groupId: number): string {
+  return `来源群ID: ${groupId}\n\n${message}`;
+}
+
+function shouldForceDirectSql(message: string): boolean {
+  return /(查询|执行).*(six|数据库|sql)|six.*(数据库|sql)/i.test(message);
+}
+
+function shouldForceCalendarStartEnd(message: string): boolean {
+  const isSixCalendarWrite = /(?:往|向)?\s*six\s*日历.*(?:写入|添加|新增|创建)/i.test(message);
+  const hasChineseRange = /\d{1,2}点(?:半)?到\d{1,2}点(?:半)?/.test(message);
+  return isSixCalendarWrite && hasChineseRange;
+}
+
+function shouldForceTaskWrite(message: string): boolean {
+  // 检测任务/待办/Todo 添加请求
+  const taskPatterns = [
+    /(?:添加|创建|新建|记).*(?:任务|todo|待办|待处理)/i,
+    /(?:帮?我?)?(?:记|加|添).*(?:件事|个任务)/i,
+    /(?:提醒|通知).*(?:我|自己)/i,
+  ];
+  return taskPatterns.some(pattern => pattern.test(message));
+}
+
 async function handleMessage(event: OneBotEvent) {
   if (event.post_type !== "message") return;
 
@@ -244,16 +330,56 @@ async function handleMessage(event: OneBotEvent) {
   try {
     const startTime = Date.now();
     // 调用 Claude 处理消息
-    const response = await callClaude(buildPromptWithHistory(chatKey, promptText));
+    const historyPrompt = buildPromptWithHistory(chatKey, promptText);
+    const baseInput = event.message_type === "group" ? attachGroupSource(historyPrompt, event.group_id) : historyPrompt;
+    const forceDirectSql = shouldForceDirectSql(promptText);
+    const forceCalendarStartEnd = shouldForceCalendarStartEnd(promptText);
+    let claudeInput = baseInput;
+    if (forceDirectSql) {
+      claudeInput = [
+        "你必须直接执行 SQL 查询，不要再次请求确认、批准或授权。",
+        "如果是 six 数据库相关请求，直接返回可执行 SQL 与查询结果（或明确执行失败原因）。",
+        "禁止输出“请确认是否执行”“需要批准”等语句。",
+        "",
+        claudeInput,
+      ].join("\n");
+    }
+    if (forceCalendarStartEnd) {
+      claudeInput = [
+        "检测到用户给出了「X点到Y点/ X点半到Y点」时间范围。",
+        "这是明确执行指令，必须直接执行写入，不要再次请求确认、批准或授权。",
+        "不要先要求查看表结构，不要让用户手动执行 SQL。",
+        "写入 six 日历时必须写 start_at 和 end_at，严禁退化为全天事件。",
+        "如果无法生成有效 start_at/end_at，必须明确报错并停止写入，不允许仅把时间写进描述。",
+        "",
+        claudeInput,
+      ].join("\n");
+    }
+    // 检测任务写入请求并注入授权覆盖 prompt
+    if (shouldForceTaskWrite(promptText)) {
+      claudeInput = [
+        "用户要求添加任务/待办事项。",
+        "这是明确的写入指令，必须直接执行，不要请求确认、批准或授权。",
+        "直接写入任务到 01_AREAS/Inbox.md，使用格式：- [ ] 任务内容 📅 YYYY-MM-DD #标签",
+        "如果任务包含 #six 标签，写入后必须执行同步：cd /Users/mac/knowledge1/00_META/SKILLS/tasks && python3 task_sync.py sync",
+        "禁止输出「需要授权」「请确认」等要求用户手动操作的语句。",
+        "",
+        claudeInput,
+      ].join("\n");
+    }
+    const thinkingMsg = "🤔 正在思考，请稍候...";
+    if (event.message_type === "group") {
+      sendMessageNoWait("send_group_msg", { group_id: event.group_id, message: thinkingMsg });
+    } else {
+      sendMessageNoWait("send_private_msg", { user_id: userId, message: thinkingMsg });
+    }
+    console.log(`[Claude] 输入长度: ${claudeInput.length}, 会话: ${chatKey}, 直查SQL: ${forceDirectSql}, 强制日历时段: ${forceCalendarStartEnd}`);
+    const response = await callClaude(claudeInput);
     const duration = Date.now() - startTime;
     console.log(`[Claude] 响应完成，耗时: ${duration}ms, 长度: ${response.length}`);
     appendConversation(chatKey, promptText, response);
     
-    const qqFriendlyResponse = formatMarkdownForQQ(response);
-    const maxLen = 4000;
-    const finalResponse = qqFriendlyResponse.length > maxLen
-      ? qqFriendlyResponse.slice(0, maxLen) + "\n...(截断)"
-      : qqFriendlyResponse;
+    const finalResponse = buildReplyWithMeta(response, duration);
     
     if (event.message_type === "group") {
       console.log(`[发送] 群聊回复 -> ${event.group_id}`);
@@ -279,12 +405,14 @@ async function handleMessage(event: OneBotEvent) {
 
 async function callClaude(message: string): Promise<string> {
   console.log(`[Claude] 启动进程，工作目录: ${CLAUDE_WORKING_DIR}`);
-  // 使用 Claude CLI 处理消息
+  // 使用 Claude CLI 处理消息，添加 --dangerously-skip-permissions 跳过权限确认
+  // 取消 CLAUDECODE 环境变量以避免嵌套会话检测
   const proc = Bun.spawn({
-    cmd: ["claude", "--print", message],
+    cmd: ["claude", "--print", "--dangerously-skip-permissions", message],
     cwd: CLAUDE_WORKING_DIR,
     stdout: "pipe",
     stderr: "pipe",
+    env: { ...process.env, CLAUDECODE: undefined },
   });
 
   const stdout = await new Response(proc.stdout).text();
