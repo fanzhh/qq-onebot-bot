@@ -107,7 +107,13 @@ chmod +x deploy/service.sh
 |------|--------|------|
 | ONEBOT_PORT | 3002 | WebSocket 端口 |
 | ONEBOT_TOKEN | "" | 访问令牌 |
+| ALLOWED_GROUP_IDS | "" | 群白名单，逗号分隔（配置后仅这些群可触发） |
 | CLAUDE_WORKING_DIR | $HOME | Claude 工作目录 |
+| CLAUDE_MODEL_LABEL | Claude CLI | 回复里展示的模型标识 |
+| CLAUDE_MODEL_PRIMARY | "" | Claude 一级模型（留空跳过） |
+| CLAUDE_MODEL_SECONDARY | "" | Claude 二级模型（留空跳过） |
+| CLAUDE_MODEL_TERTIARY | "" | Claude 三级模型（留空=CLI默认模型） |
+| CLAUDE_MODEL_CANDIDATES | "" | 候选模型列表（逗号/换行分隔，按顺序尝试，优先于三层配置） |
 
 ## 故障排除
 
