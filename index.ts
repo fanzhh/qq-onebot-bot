@@ -817,9 +817,63 @@ async function handleMessage(event: OneBotEvent) {
   }
 }
 
-// ============== AI 调用（简化版）=============
+// ============== AI 调用（优先本地 DeepSeek）=============
 
-// 简化的 Claude CLI 调用 - 单次调用，短超时
+// 本地 DeepSeek 配置
+const LOCAL_DEEPSEEK_URL = process.env.LOCAL_DEEPSEEK_URL || "http://localhost:8000/v1/chat/completions";
+const LOCAL_DEEPSEEK_MODEL = process.env.LOCAL_DEEPSEEK_MODEL || "deepseek-chat";
+const LOCAL_DEEPSEEK_API_KEY = process.env.LOCAL_DEEPSEEK_API_KEY || "sk-no-key-required";
+
+// 调用本地 DeepSeek API
+async function callLocalDeepSeek(
+  message: string,
+  timeoutMs: number = 20000,
+): Promise<string> {
+  const callStart = Date.now();
+  console.log(`[DeepSeek-Local] 调用开始，URL: ${LOCAL_DEEPSEEK_URL}`);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(LOCAL_DEEPSEEK_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${LOCAL_DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: LOCAL_DEEPSEEK_MODEL,
+        messages: [{ role: "user", content: message }],
+        max_tokens: 2000,
+        temperature: 0.7,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[DeepSeek-Local] API错误: ${response.status} - ${errorText.slice(0, 200)}`);
+      throw new Error(`DeepSeek API错误: ${response.status}`);
+    }
+
+    const result = await response.json();
+    const answer = result.choices?.[0]?.message?.content || result.output || result.text || result.response || "无响应";
+
+    console.log(`[DeepSeek-Local] 完成，耗时: ${Date.now() - callStart}ms`);
+    return answer.trim();
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`DeepSeek 调用超时 (${timeoutMs}ms)`);
+    }
+    throw error;
+  }
+}
+
+// Claude CLI 调用（降级用）
 async function callClaude(
   message: string,
   timeoutMs: number = 20000,
@@ -835,7 +889,6 @@ async function callClaude(
     env: { ...process.env, CLAUDECODE: undefined },
   });
 
-  // 超时处理
   const timeoutId = setTimeout(() => {
     console.log(`[Claude] 超时 ${timeoutMs}ms，终止进程`);
     proc.kill();
@@ -861,19 +914,28 @@ async function callClaude(
   }
 }
 
-// 简化的 AI 调用接口 - 单次调用，快速失败
+// AI 调用接口 - 优先本地 DeepSeek，失败降级到 Claude
 async function callAI(message: string): Promise<string> {
-  // 简单问题用短超时，复杂问题用中等超时
   const isComplexQuery = message.length > 500 || /分析|总结|比较|查询多个/i.test(message);
   const timeoutMs = isComplexQuery ? 30000 : 15000;
 
   console.log(`[AI] 调用开始，类型: ${isComplexQuery ? '复杂' : '简单'}，超时: ${timeoutMs}ms`);
 
+  // 1. 优先尝试本地 DeepSeek
   try {
+    console.log(`[AI] 尝试本地 DeepSeek...`);
+    return await callLocalDeepSeek(message, timeoutMs);
+  } catch (error) {
+    console.log(`[AI] DeepSeek 不可用，降级到 Claude CLI: ${error}`);
+  }
+
+  // 2. 降级到 Claude CLI
+  try {
+    console.log(`[AI] 尝试 Claude CLI...`);
     return await callClaude(message, timeoutMs);
   } catch (error) {
-    console.error(`[AI] 调用失败:`, error);
-    return "⏱️ 响应超时，请简化问题或稍后重试";
+    console.error(`[AI] Claude 也失败:`, error);
+    return "⏱️ 所有模型都超时，请稍后重试";
   }
 }
 
