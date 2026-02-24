@@ -772,7 +772,7 @@ async function handleMessage(event: OneBotEvent) {
     console.log(`[步骤6] 调用AI模型...`);
     console.log(`[步骤6] 输入长度: ${claudeInput.length}字符`);
     const aiStart = Date.now();
-    const response = await callAI(claudeInput, 30000);
+    const response = await callAI(claudeInput);
     stepTimes['aiCall'] = Date.now() - aiStart;
     console.log(`[步骤6] ✓ AI响应完成，耗时: ${stepTimes['aiCall']}ms, 响应长度: ${response.length}字符`);
 
@@ -817,101 +817,64 @@ async function handleMessage(event: OneBotEvent) {
   }
 }
 
-// ============== AI 调用 ==============
+// ============== AI 调用（简化版）=============
 
-const CLAUDE_MODEL_PRIMARY = process.env.CLAUDE_MODEL_PRIMARY || "";
-const CLAUDE_MODEL_SECONDARY = process.env.CLAUDE_MODEL_SECONDARY || "";
-const CLAUDE_MODEL_TERTIARY = process.env.CLAUDE_MODEL_TERTIARY || "";
-const CLAUDE_MODEL_CANDIDATES_RAW = process.env.CLAUDE_MODEL_CANDIDATES || "";
-
-function getClaudeModelCandidates(): string[] {
-  if (CLAUDE_MODEL_CANDIDATES_RAW.trim()) {
-    return CLAUDE_MODEL_CANDIDATES_RAW
-      .split(/[,\n]/)
-      .map((item) => item.trim())
-      .filter(Boolean);
-  }
-  return [CLAUDE_MODEL_PRIMARY, CLAUDE_MODEL_SECONDARY, CLAUDE_MODEL_TERTIARY].filter(Boolean);
-}
-
+// 简化的 Claude CLI 调用 - 单次调用，短超时
 async function callClaude(
   message: string,
-  timeoutMs: number = 30000,
-  model?: string,
-  tierLabel: string = "默认",
+  timeoutMs: number = 20000,
 ): Promise<string> {
   const callStart = Date.now();
-  const modelInfo = model || "CLI默认模型";
-  console.log(`[Claude] 启动进程(${tierLabel})，模型: ${modelInfo}, 工作目录: ${CLAUDE_WORKING_DIR}, 超时: ${timeoutMs}ms`);
+  console.log(`[Claude] 调用开始，超时: ${timeoutMs}ms`);
 
-  // 使用 Claude CLI 处理消息，添加 --dangerously-skip-permissions 跳过权限确认
-  // 取消 CLAUDECODE 环境变量以避免嵌套会话检测
-  const spawnStart = Date.now();
-  const cmd = ["claude", "--print", "--dangerously-skip-permissions"];
-  if (model) cmd.push("--model", model);
-  cmd.push(message);
   const proc = Bun.spawn({
-    cmd,
+    cmd: ["claude", "--print", "--dangerously-skip-permissions", message],
     cwd: CLAUDE_WORKING_DIR,
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, CLAUDECODE: undefined },
   });
-  console.log(`[Claude] 进程启动耗时: ${Date.now() - spawnStart}ms`);
 
-  // 设置超时
-  let timeoutId: Timer | null = null;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error(`Claude 调用超时 (${timeoutMs}ms)`)), timeoutMs);
-  });
+  // 超时处理
+  const timeoutId = setTimeout(() => {
+    console.log(`[Claude] 超时 ${timeoutMs}ms，终止进程`);
+    proc.kill();
+  }, timeoutMs);
 
-  const readStart = Date.now();
   try {
-    const result = await Promise.race([
-      (async () => {
-        const stdout = await new Response(proc.stdout).text();
-        const stderr = await new Response(proc.stderr).text();
-        const exitCode = await proc.exited;
-        return { stdout, stderr, exitCode };
-      })(),
-      timeoutPromise,
-    ]);
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    clearTimeout(timeoutId);
 
-    console.log(`[Claude] 读取输出耗时: ${Date.now() - readStart}ms`);
-    console.log(`[Claude] 进程退出码: ${result.exitCode}, 总耗时: ${Date.now() - callStart}ms`);
+    console.log(`[Claude] 完成，耗时: ${Date.now() - callStart}ms，退出码: ${exitCode}`);
 
-    if (result.stderr) {
-      console.log(`[Claude] stderr: ${result.stderr.slice(0, 200)}`);
+    if (exitCode !== 0) {
+      console.error(`[Claude] 错误: ${stderr.slice(0, 200)}`);
+      throw new Error(`Claude 调用失败: ${exitCode}`);
     }
 
-    if (result.exitCode !== 0) {
-      console.error("[Claude] 错误:", result.stderr);
-      throw new Error("Claude 调用失败");
-    }
-
-    return result.stdout.trim() || "（无响应）";
+    return stdout.trim() || "（无响应）";
   } catch (error) {
-    // 超时或错误，终止进程
     proc.kill();
     throw error;
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
   }
 }
 
-// 统一的 AI 调用接口：1) deepseek-chat 2) Claude默认模型
-async function callAI(message: string, timeoutMs: number = 30000): Promise<string> {
-  try {
-    const primaryTimeoutMs = Math.max(timeoutMs, 180000);
-    console.log("[AI] 一级模型: deepseek-chat");
-    return await callClaude(message, primaryTimeoutMs, "deepseek-chat", "一级");
-  } catch (error) {
-    console.log(`[AI] 一级模型失败，回退默认模型: ${error}`);
-  }
+// 简化的 AI 调用接口 - 单次调用，快速失败
+async function callAI(message: string): Promise<string> {
+  // 简单问题用短超时，复杂问题用中等超时
+  const isComplexQuery = message.length > 500 || /分析|总结|比较|查询多个/i.test(message);
+  const timeoutMs = isComplexQuery ? 30000 : 15000;
 
-  const fallbackTimeoutMs = Math.max(timeoutMs, 300000);
-  console.log(`[AI] 默认模型: Claude CLI默认, 超时: ${fallbackTimeoutMs}ms`);
-  return await callClaude(message, fallbackTimeoutMs, undefined, "默认回退");
+  console.log(`[AI] 调用开始，类型: ${isComplexQuery ? '复杂' : '简单'}，超时: ${timeoutMs}ms`);
+
+  try {
+    return await callClaude(message, timeoutMs);
+  } catch (error) {
+    console.error(`[AI] 调用失败:`, error);
+    return "⏱️ 响应超时，请简化问题或稍后重试";
+  }
 }
 
 // ============== 定时任务：工作日08:30发送工作提醒 ==============
@@ -971,7 +934,7 @@ async function sendDailyWorkReminder() {
   ].join("\n");
 
   try {
-    const response = await callAI(reminderPrompt, 60000);
+    const response = await callAI(reminderPrompt);
     sendMessageNoWait("send_group_msg", { group_id: WORK_GROUP_ID, message: response });
     console.log("[定时任务] 工作提醒已发送");
   } catch (error) {
