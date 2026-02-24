@@ -819,8 +819,8 @@ async function handleMessage(event: OneBotEvent) {
 
 // ============== AI 调用（Claude CLI + 本地 DeepSeek）=============
 
-// DeepSeek 配置路径
-const DEEPSEEK_CONFIG_PATH = `${process.env.HOME}/.claude/settings-deepseek.json`;
+// DeepSeek 配置路径 (使用 ds2api.json 指向本地 5001 端口)
+const DEEPSEEK_CONFIG_PATH = `${process.env.HOME}/.claude/settings-ds2api.json`;
 
 // 使用 Claude CLI 调用本地 DeepSeek 服务
 async function callDeepSeek(
