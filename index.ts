@@ -647,10 +647,10 @@ async function handleMessage(event: OneBotEvent) {
           return;
         }
 
-        // Skill 类型命令 - 构建 prompt 调用 skill
+        // Skill 类型命令 - 直接调用 skill，不经过 AI 判断流程
         if (quickCmd.command.type === "skill" && quickCmd.command.buildPrompt) {
-          // 构建对应技能的 prompt - 直接指示调用特定 skill，不经过 AI 判断
-          promptText = [
+          // 构建对应技能的 prompt - 直接指示调用特定 skill
+          const skillPrompt = [
             `来源群ID: ${WORK_GROUP_ID}`,
             "",
             `【系统指令】这是快捷命令 ${quickCmd.command.name}，必须直接调用 ${quickCmd.command.skill} skill 执行，不需要 AI 判断或路由。`,
@@ -664,8 +664,28 @@ async function handleMessage(event: OneBotEvent) {
             "4. 直接返回执行结果",
           ].join("\n");
 
-          isQuickEventCommand = true;
-          console.log(`[快捷命令] 已转换 prompt，直接调用 skill: ${quickCmd.command.skill}`);
+          console.log(`[快捷命令] 直接调用 skill: ${quickCmd.command.skill}`);
+
+          // 发送"思考中"提示
+          sendMessageNoWait("send_group_msg", { group_id: event.group_id, message: "🤔 正在查询，请稍候..." });
+
+          try {
+            const startTime = Date.now();
+            // /文档 命令使用 sixqa 项目（工作文档在那里）
+            const isDocCommand = quickCmd.command.name === "/文档";
+            const response = isDocCommand
+              ? await callSixQA(skillPrompt, 120000)  // 文档查询用 sixqa，120秒超时
+              : await callDeepSeek(skillPrompt, 60000); // 其他用 knowledge1，60秒超时
+            const duration = Date.now() - startTime;
+
+            const finalResponse = buildReplyWithMeta(response, duration);
+            sendMessageNoWait("send_group_msg", { group_id: event.group_id, message: finalResponse });
+            console.log(`[快捷命令] skill 响应已发送，耗时: ${duration}ms`);
+          } catch (error) {
+            console.error(`[快捷命令] skill 调用失败:`, error);
+            sendMessageNoWait("send_group_msg", { group_id: event.group_id, message: "❌ 查询失败，请稍后重试" });
+          }
+          return; // 直接返回，不执行后续流程
         }
       }
     }
@@ -827,6 +847,9 @@ const DEEPSEEK_ENV = {
   ANTHROPIC_SMALL_FAST_MODEL: "deepseek-chat",
 };
 
+// sixqa 项目路径
+const SIXQA_DIR = `${process.env.HOME}/projects/sixqa`;
+
 // 使用 Claude CLI 调用本地 DeepSeek 服务
 async function callDeepSeek(
   message: string,
@@ -863,6 +886,53 @@ async function callDeepSeek(
     if (exitCode !== 0) {
       console.error(`[DeepSeek] 错误: ${stderr.slice(0, 200)}`);
       throw new Error(`DeepSeek 调用失败: ${exitCode}`);
+    }
+
+    return stdout.trim() || "（无响应）";
+  } catch (error) {
+    proc.kill();
+    throw error;
+  }
+}
+
+// 调用 sixqa 项目查询工作文件
+async function callSixQA(
+  message: string,
+  timeoutMs: number = 60000,
+): Promise<string> {
+  const callStart = Date.now();
+  console.log(`[SixQA] 查询工作文件，目录: ${SIXQA_DIR}, 超时: ${timeoutMs}ms`);
+
+  // sixqa 项目使用 Ollama (qwen2.5:7b)，不使用 DeepSeek API
+  // 所以不要覆盖 ANTHROPIC 环境变量
+  const proc = Bun.spawn({
+    cmd: ["claude", "--print", "--dangerously-skip-permissions", message],
+    cwd: SIXQA_DIR,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      CLAUDECODE: undefined,
+      // 不设置 DEEPSEEK_ENV，让 sixqa 使用自己的 Ollama 配置
+    },
+  });
+
+  const timeoutId = setTimeout(() => {
+    console.log(`[SixQA] 超时 ${timeoutMs}ms，终止进程`);
+    proc.kill();
+  }, timeoutMs);
+
+  try {
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    clearTimeout(timeoutId);
+
+    console.log(`[SixQA] 完成，耗时: ${Date.now() - callStart}ms，退出码: ${exitCode}`);
+
+    if (exitCode !== 0) {
+      console.error(`[SixQA] 错误: ${stderr.slice(0, 200)}`);
+      throw new Error(`SixQA 调用失败: ${exitCode}`);
     }
 
     return stdout.trim() || "（无响应）";
@@ -913,21 +983,55 @@ async function callClaude(
   }
 }
 
-// AI 调用接口 - 优先使用 Claude CLI + 本地 DeepSeek 服务
+// 可用的项目和技能
+const AVAILABLE_PROJECTS = {
+  knowledge1: {
+    path: `${process.env.HOME}/knowledge1`,
+    description: "个人知识库，包含日历、任务、健康记录等",
+    skills: ["work-calendar", "task-query", "personal-health", "vector-search"],
+  },
+  sixqa: {
+    path: `${process.env.HOME}/projects/sixqa`,
+    description: "工作文件问答系统，包含案件、检查记录、文档等",
+    skills: ["document-search", "case-query"],
+  },
+};
+
+// AI 调用接口 - 让 AI 判断使用哪个项目
 async function callAI(message: string): Promise<string> {
-  const isComplexQuery = message.length > 500 || /分析|总结|比较|查询多个/i.test(message);
-  const timeoutMs = isComplexQuery ? 30000 : 20000;
+  // 构建路由提示，让 AI 决定使用哪个项目
+  const routingPrompt = [
+    "【系统指令】请根据用户问题，判断应该使用哪个项目来回答。",
+    "",
+    "可用项目：",
+    "1. knowledge1 - 个人知识库，包含：",
+    "   - 日历和任务（work-calendar skill）",
+    "   - 健康记录（personal-health skill）",
+    "   - 个人笔记和文档（vector-search skill）",
+    "",
+    "2. sixqa - 工作文件问答系统，包含：",
+    "   - 案件记录和检查报告",
+    "   - 工作文档和法规文件",
+    "   - 药品监管相关档案",
+    "",
+    "用户问题：" + message,
+    "",
+    "请直接调用合适的项目来回答，不需要解释你的选择过程。",
+  ].join("\n");
 
-  console.log(`[AI] 调用开始，类型: ${isComplexQuery ? '复杂' : '简单'}, 超时: ${timeoutMs}ms`);
+  console.log(`[AI] 调用开始，让 AI 判断使用哪个项目...`);
 
-  // 所有查询都通过 Claude CLI + 本地 DeepSeek 服务
-  // 这样既能使用 CLAUDE.md 配置，又能调用本地模型
-  console.log(`[AI] 使用 Claude CLI + 本地 DeepSeek 服务...`);
+  // 首先尝试让 AI 在 knowledge1 中判断和回答
   try {
-    return await callDeepSeek(message, timeoutMs);
+    return await callDeepSeek(routingPrompt, 60000);
   } catch (error) {
-    console.log(`[AI] DeepSeek 失败，降级到默认 Claude: ${error}`);
-    return await callClaude(message, timeoutMs);
+    console.log(`[AI] knowledge1 失败，尝试 sixqa: ${error}`);
+    try {
+      return await callSixQA(routingPrompt, 60000);
+    } catch (error2) {
+      console.log(`[AI] sixqa 也失败，降级到默认 Claude: ${error2}`);
+      return await callClaude(message, 30000);
+    }
   }
 }
 
